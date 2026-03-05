@@ -14,17 +14,20 @@ import {
   getSubscribersForValidator,
   getValidatorState,
   upsertValidatorState,
+  logAlert,
 } from "./db.js";
 
-const POLL_INTERVAL_MS = 60_000;
-const OFFLINE_THRESHOLD_MS = 30 * 60 * 1000; // 30 minutes
+const ADMIN_CHAT_ID = process.env["ADMIN_CHAT_ID"] ? Number(process.env["ADMIN_CHAT_ID"]) : null;
 
-// Cache of dominant version per network (to detect outdated validators)
-const dominantVersionCache: Partial<Record<Network, string>> = {};
-
-function emoji(active: boolean): string {
-  return active ? "🟢" : "🔴";
+async function notifyAdmin(bot: Bot, msg: string): Promise<void> {
+  if (!ADMIN_CHAT_ID) return;
+  await bot.api.sendMessage(ADMIN_CHAT_ID, msg, { parse_mode: "Markdown" }).catch(() => {});
 }
+
+const POLL_INTERVAL_MS = 5 * 60_000;
+const OFFLINE_THRESHOLD_MS = 25 * 60 * 1000;
+
+const dominantVersionCache: Partial<Record<Network, string>> = {};
 
 function formatLastSeen(last_seen_at: string | null): string {
   if (!last_seen_at) return "unknown";
@@ -48,7 +51,6 @@ function getDominantVersion(validators: Validator[]): string | null {
 async function pollNetwork(bot: Bot, network: Network): Promise<void> {
   const cfg = NETWORK_CONFIG[network];
 
-  // Fetch all validators
   const result = await fetchWithFallback<ValidatorsResponse>(
     "/api/validators?page_size=5000",
     network,
@@ -58,18 +60,15 @@ async function pollNetwork(bot: Bot, network: Network): Promise<void> {
   const validators = result.data.data ?? result.data.validators ?? [];
   if (validators.length === 0) return;
 
-  // Update dominant version cache
   const dominant = getDominantVersion(validators);
   if (dominant) dominantVersionCache[network] = dominant;
 
-  // Build lookup map
   const validatorMap = new Map<string, Validator>();
   for (const v of validators) {
     if (v.party_id) validatorMap.set(v.party_id, v);
     validatorMap.set(v.id, v);
   }
 
-  // Check tracked validators
   const tracked = getTrackedValidators().filter((t) => t.network === network);
 
   for (const { party_id } of tracked) {
@@ -80,7 +79,6 @@ async function pollNetwork(bot: Bot, network: Network): Promise<void> {
     const isActive = v.is_active ?? false;
     const lastSeenAt = v.last_seen_at ?? null;
 
-    // Check if offline by last_seen_at threshold even if is_active=true
     const lastSeenMs = lastSeenAt ? Date.now() - new Date(lastSeenAt).getTime() : null;
     const stale = lastSeenMs !== null && lastSeenMs > OFFLINE_THRESHOLD_MS;
     const effectivelyActive = isActive && !stale;
@@ -93,7 +91,6 @@ async function pollNetwork(bot: Bot, network: Network): Promise<void> {
     const label = cfg.label;
     const name = v.name ?? party_id.slice(0, 20) + "…";
 
-    // Alert: went offline
     if (prevState && prevState.is_active === 1 && !effectivelyActive) {
       const reason = !isActive ? "is_active = false" : `not seen for ${formatLastSeen(lastSeenAt)}`;
       const msg =
@@ -103,23 +100,23 @@ async function pollNetwork(bot: Bot, network: Network): Promise<void> {
         `Party: \`${party_id}\``;
       for (const chat_id of subscribers) {
         await bot.api.sendMessage(chat_id, msg, { parse_mode: "Markdown" }).catch(() => {});
+        logAlert(chat_id, party_id, network, "offline");
       }
     }
 
-    // Alert: came back online
     if (prevState && prevState.is_active === 0 && effectivelyActive) {
       const msg =
         `🟢 *[${label}] Validator back online*\n` + `*${name}*\n` + `Party: \`${party_id}\``;
       for (const chat_id of subscribers) {
         await bot.api.sendMessage(chat_id, msg, { parse_mode: "Markdown" }).catch(() => {});
+        logAlert(chat_id, party_id, network, "online");
       }
     }
 
-    // Alert: version outdated
     const dom = dominantVersionCache[network];
     if (dom && v.version && v.version !== dom) {
       const prevVersion = prevState?.version;
-      if (prevVersion === v.version) continue; // already alerted for this version
+      if (prevVersion === v.version) continue;
       const msg =
         `⚠️ *[${label}] Outdated version*\n` +
         `*${name}*\n` +
@@ -127,6 +124,7 @@ async function pollNetwork(bot: Bot, network: Network): Promise<void> {
         `Party: \`${party_id}\``;
       for (const chat_id of subscribers) {
         await bot.api.sendMessage(chat_id, msg, { parse_mode: "Markdown" }).catch(() => {});
+        logAlert(chat_id, party_id, network, "version");
       }
     }
   }
@@ -147,21 +145,16 @@ export async function findAllValidators(query: string, network: Network): Promis
   const validators = result.data.data ?? result.data.validators ?? [];
   const q = query.toLowerCase();
 
-  // 1. Exact match by party_id or id
   const exact = validators.filter((v) => v.party_id === query || v.id === query);
   if (exact.length > 0) return exact;
 
-  // 2. Exact match by name (case-insensitive)
   const byName = validators.filter((v) => v.name?.toLowerCase() === q);
   if (byName.length > 0) return byName;
 
-  // 3. Partial match by name
   const byNamePartial = validators.filter((v) => v.name?.toLowerCase().includes(q));
   if (byNamePartial.length > 0) return byNamePartial;
 
-  // 4. Partial match by id prefix
-  const byIdPartial = validators.filter((v) => v.id.toLowerCase().startsWith(q));
-  return byIdPartial;
+  return validators.filter((v) => v.id.toLowerCase().startsWith(q));
 }
 
 export async function getNetworkStats(network: Network): Promise<{
@@ -173,6 +166,8 @@ export async function getNetworkStats(network: Network): Promise<{
   return { stats: result.data, source: result.source };
 }
 
+export const lastPollOk: Partial<Record<Network, Date>> = {};
+
 export function startMonitor(bot: Bot): void {
   console.log("[monitor] starting polling for networks:", NETWORKS.join(", "));
 
@@ -180,13 +175,17 @@ export function startMonitor(bot: Bot): void {
     for (const network of NETWORKS) {
       try {
         await pollNetwork(bot, network);
+        lastPollOk[network] = new Date();
       } catch (err) {
         console.error(`[monitor] error polling ${network}:`, err);
+        const msg =
+          `⚠️ *[Monitor] Poll error — ${network}*\n` +
+          `\`${err instanceof Error ? err.message : String(err)}\``;
+        await notifyAdmin(bot, msg);
       }
     }
   };
 
-  // Initial poll after 10s (let bot initialize first)
   setTimeout(() => {
     void poll();
     setInterval(() => void poll(), POLL_INTERVAL_MS);

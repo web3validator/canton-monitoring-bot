@@ -8,6 +8,8 @@ const DB_PATH = process.env["DB_PATH"] ?? path.join(__dirname, "../../data/bot.d
 
 const db = new Database(DB_PATH);
 
+db.exec(`DROP TABLE IF EXISTS validator_state;`);
+
 db.exec(`
   CREATE TABLE IF NOT EXISTS subscriptions (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -26,6 +28,15 @@ db.exec(`
     last_seen_at TEXT,
     updated_at  TEXT    NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (party_id, network)
+  );
+
+  CREATE TABLE IF NOT EXISTS alert_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id     INTEGER NOT NULL,
+    party_id    TEXT    NOT NULL,
+    network     TEXT    NOT NULL,
+    type        TEXT    NOT NULL,
+    sent_at     TEXT    NOT NULL DEFAULT (datetime('now'))
   );
 `);
 
@@ -46,16 +57,17 @@ export interface ValidatorState {
   updated_at: string;
 }
 
-// ── Subscriptions ─────────────────────────────────────────────────────────────
 
 export function addSubscription(chat_id: number, party_id: string, network: Network): boolean {
   try {
-    db.prepare(
-      `INSERT INTO subscriptions (chat_id, party_id, network) VALUES (?, ?, ?)`,
-    ).run(chat_id, party_id, network);
+    db.prepare(`INSERT INTO subscriptions (chat_id, party_id, network) VALUES (?, ?, ?)`).run(
+      chat_id,
+      party_id,
+      network,
+    );
     return true;
   } catch {
-    return false; // already exists
+    return false;
   }
 }
 
@@ -83,16 +95,13 @@ export function getSubscribersForValidator(party_id: string, network: Network): 
   return rows.map((r) => r.chat_id);
 }
 
-// Returns all unique (party_id, network) pairs being tracked
 export function getTrackedValidators(): { party_id: string; network: Network }[] {
-  return db
-    .prepare(
-      `SELECT DISTINCT party_id, network FROM subscriptions`,
-    )
-    .all() as { party_id: string; network: Network }[];
+  return db.prepare(`SELECT DISTINCT party_id, network FROM subscriptions`).all() as {
+    party_id: string;
+    network: Network;
+  }[];
 }
 
-// ── Validator state cache ─────────────────────────────────────────────────────
 
 export function getValidatorState(party_id: string, network: Network): ValidatorState | null {
   return (
@@ -100,6 +109,44 @@ export function getValidatorState(party_id: string, network: Network): Validator
       .prepare(`SELECT * FROM validator_state WHERE party_id = ? AND network = ?`)
       .get(party_id, network) as ValidatorState | undefined) ?? null
   );
+}
+
+
+export function logAlert(chat_id: number, party_id: string, network: Network, type: string): void {
+  db.prepare(`INSERT INTO alert_log (chat_id, party_id, network, type) VALUES (?, ?, ?, ?)`).run(
+    chat_id,
+    party_id,
+    network,
+    type,
+  );
+}
+
+export function getAlertCount24h(): number {
+  const row = db
+    .prepare(`SELECT COUNT(*) as cnt FROM alert_log WHERE sent_at >= datetime('now', '-24 hours')`)
+    .get() as { cnt: number };
+  return row.cnt;
+}
+
+export function getUniqueUsersCount(): number {
+  const row = db.prepare(`SELECT COUNT(DISTINCT chat_id) as cnt FROM subscriptions`).get() as {
+    cnt: number;
+  };
+  return row.cnt;
+}
+
+export function getSubscriptionsCount(): number {
+  const row = db.prepare(`SELECT COUNT(*) as cnt FROM subscriptions`).get() as { cnt: number };
+  return row.cnt;
+}
+
+export function getSubscriptionsByNetwork(): Record<string, number> {
+  const rows = db
+    .prepare(`SELECT network, COUNT(*) as cnt FROM subscriptions GROUP BY network`)
+    .all() as { network: string; cnt: number }[];
+  const result: Record<string, number> = {};
+  for (const r of rows) result[r.network] = r.cnt;
+  return result;
 }
 
 export function upsertValidatorState(

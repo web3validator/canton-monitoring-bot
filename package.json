@@ -10,8 +10,9 @@
     "dev": "tsx watch src/bot.ts"
   },
   "dependencies": {
-    "grammy": "^1.30.0",
+    "@grammyjs/conversations": "^2.1.1",
     "better-sqlite3": "^9.4.3",
+    "grammy": "^1.30.0",
     "undici": "^6.19.2"
   },
   "devDependencies": {

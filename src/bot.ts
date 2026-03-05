@@ -1,4 +1,10 @@
-import { Bot, InlineKeyboard } from "grammy";
+import { Bot, InlineKeyboard, Keyboard, session, type Context, type SessionFlavor } from "grammy";
+import {
+  conversations,
+  createConversation,
+  type Conversation,
+  type ConversationFlavor,
+} from "@grammyjs/conversations";
 import {
   parseNetwork,
   NETWORK_CONFIG,
@@ -7,7 +13,19 @@ import {
   type Network,
 } from "./networks.js";
 import { addSubscription, removeSubscription, getSubscriptions } from "./db.js";
-import { getValidatorInfo, findAllValidators, getNetworkStats, startMonitor } from "./monitor.js";
+import {
+  getValidatorInfo,
+  findAllValidators,
+  getNetworkStats,
+  startMonitor,
+  lastPollOk,
+} from "./monitor.js";
+import {
+  getUniqueUsersCount,
+  getSubscriptionsCount,
+  getSubscriptionsByNetwork,
+  getAlertCount24h,
+} from "./db.js";
 
 const BOT_TOKEN = process.env["BOT_TOKEN"];
 if (!BOT_TOKEN) {
@@ -15,63 +33,339 @@ if (!BOT_TOKEN) {
   process.exit(1);
 }
 
-export const bot = new Bot(BOT_TOKEN);
+const ADMIN_CHAT_ID = process.env["ADMIN_CHAT_ID"] ? Number(process.env["ADMIN_CHAT_ID"]) : null;
 
-// ── Register bot commands menu ────────────────────────────────────────────────
-await bot.api.setMyCommands([
-  { command: "start", description: "Welcome message & quick buttons" },
-  { command: "help", description: "Show all commands" },
-  { command: "track", description: "Subscribe to validator alerts" },
-  { command: "untrack", description: "Unsubscribe from validator" },
-  { command: "status", description: "Get current validator status" },
-  { command: "list", description: "List all your subscriptions" },
-  { command: "network", description: "Network stats (mainnet/testnet/devnet)" },
-]);
+type SessionData = Record<string, never>;
+type MyContext = Context &
+  SessionFlavor<SessionData> &
+  ConversationFlavor<Context & SessionFlavor<SessionData>>;
+type MyConversation = Conversation<MyContext, MyContext>;
 
-// ── Keyboards ─────────────────────────────────────────────────────────────────
+export const bot = new Bot<MyContext>(BOT_TOKEN);
 
-function mainKeyboard(): InlineKeyboard {
-  return new InlineKeyboard()
-    .text("📊 MainNet Stats", "net:mainnet")
-    .text("📊 TestNet Stats", "net:testnet")
+
+bot.use(session<SessionData, MyContext>({ initial: () => ({}) }));
+bot.use(conversations());
+
+
+function mainKeyboard(): Keyboard {
+  return new Keyboard()
+    .text("🟢 Status")
+    .text("📋 My List")
     .row()
-    .text("📊 DevNet Stats", "net:devnet")
-    .text("📋 My List", "cmd:list");
+    .text("➕ Subscribe")
+    .text("🗑 Unsubscribe")
+    .row()
+    .text("📊 Network Stats")
+    .resized()
+    .persistent();
 }
 
-async function sendStartMessage(ctx: { reply: Function }): Promise<void> {
+function networkKeyboard(): InlineKeyboard {
+  return new InlineKeyboard()
+    .text("MainNet", "net:mainnet")
+    .text("TestNet", "net:testnet")
+    .text("DevNet", "net:devnet");
+}
+
+
+const callbackCache = new Map<string, string>();
+let callbackCounter = 0;
+
+function storeCallback(value: string): string {
+  const key = String(callbackCounter++);
+  callbackCache.set(key, value);
+  return key;
+}
+
+function loadCallback(key: string): string | undefined {
+  return callbackCache.get(key);
+}
+
+
+async function fetchUptime(party_id: string, network: Network): Promise<string> {
+  const cfg = NETWORK_CONFIG[network];
+  try {
+    const res = await fetch(
+      `${cfg.indexerUrl}/api/validators/${encodeURIComponent(party_id)}/uptime?limit=168`,
+    );
+    if (!res.ok) return "";
+    const data = (await res.json()) as { uptime_pct?: number | string };
+    if (data.uptime_pct == null) return "";
+    return `\n*Uptime 7d:* ${Number(data.uptime_pct).toFixed(1)}%`;
+  } catch {
+    return "";
+  }
+}
+
+async function sendValidatorStatus(ctx: MyContext, query: string, network: Network): Promise<void> {
+  const label = NETWORK_CONFIG[network].label;
+  const matches = await findAllValidators(query, network);
+
+  if (matches.length === 0) {
+    await ctx.reply(`❌ Validator not found on ${label}.`);
+    return;
+  }
+
+  if (matches.length > 1) {
+    const kb = new InlineKeyboard();
+    for (const v of matches.slice(0, 8)) {
+      const name = v.name ?? v.id.split("::")[0];
+      const key = storeCallback(`${network}:${v.party_id ?? v.id}`);
+      kb.text(name!, `sv:${key}`).row();
+    }
+    await ctx.reply(`🔎 Found ${matches.length} validators on ${label}. Pick one:`, {
+      reply_markup: kb,
+    });
+    return;
+  }
+
+  const v = matches[0]!;
+  const canonical_id = v.party_id ?? v.id;
+  const name = v.name ?? v.id.split("::")[0];
+  const status = v.is_active ? "🟢 Online" : "🔴 Offline";
+  const lastUpdated = v.last_seen_at ? new Date(v.last_seen_at).toUTCString() : "unknown";
+  const firstSeen = v.first_seen_at ? new Date(v.first_seen_at).toUTCString() : "unknown";
+  const uptime = await fetchUptime(canonical_id, network);
+
   await ctx.reply(
-    `👋 *Canton Network Alert Bot*\n` +
-      `Monitor validators across MainNet, TestNet and DevNet.\n` +
-      `Built on web34ever indexer infrastructure.\n\n` +
-      `*Commands:*\n` +
-      `/track <name> [network] — subscribe to alerts\n` +
-      `/untrack <name> [network] — unsubscribe\n` +
-      `/status <name> [network] — current status\n` +
-      `/list — your subscriptions\n` +
-      `/network [mainnet|testnet|devnet] — network stats\n\n` +
-      `*Networks:* mainnet · testnet · devnet\n` +
-      `*Alerts:* 🔴 offline · 🟢 back online · ⚠️ outdated version\n\n` +
-      `*Examples:*\n` +
-      `/status web34ever mainnet\n` +
-      `/track web34ever mainnet\n` +
-      `/network mainnet\n\n` +
-      `Default network: *mainnet*`,
+    `*[${label}] Validator Status*\n\n` +
+      `*Name:* ${name}\n` +
+      `*Status:* ${status}\n` +
+      `*Version:* \`${v.version ?? "unknown"}\`\n` +
+      `*Last updated:* ${lastUpdated}\n` +
+      `*First seen:* ${firstSeen}\n` +
+      uptime +
+      `\n*ID:* \`${canonical_id}\``,
+    { parse_mode: "Markdown" },
+  );
+}
+
+async function askValidatorName(
+  conversation: MyConversation,
+  ctx: MyContext,
+): Promise<string | null> {
+  const buttonTexts = [
+    "🟢 Status",
+    "➕ Subscribe",
+    "🗑 Unsubscribe",
+    "📋 My List",
+    "📊 Network Stats",
+  ];
+  await ctx.reply("Enter validator name or ID:", { reply_markup: mainKeyboard() });
+  while (true) {
+    const msg = await conversation.waitFor("message:text");
+    const text = msg.message.text.trim();
+    if (!buttonTexts.includes(text)) return text || null;
+  }
+}
+
+async function pickNetwork(conversation: MyConversation, ctx: MyContext): Promise<Network | null> {
+  await ctx.reply("Select network:", { reply_markup: networkKeyboard() });
+  const cb = await conversation.waitFor("callback_query:data");
+  const match = cb.callbackQuery.data.match(/^net:(mainnet|testnet|devnet)$/);
+  await cb.answerCallbackQuery();
+  if (!match) return null;
+  return match[1] as Network;
+}
+
+
+async function statusConversation(conversation: MyConversation, ctx: MyContext): Promise<void> {
+  const network = await pickNetwork(conversation, ctx);
+  if (!network) return;
+
+  while (true) {
+    const query = await askValidatorName(conversation, ctx);
+    if (!query) return;
+
+    const label = NETWORK_CONFIG[network].label;
+    const matches = await findAllValidators(query, network);
+
+    if (matches.length === 0) {
+      await ctx.reply(`❌ Validator not found on ${label}. Try again:`);
+      continue;
+    }
+
+    await ctx.reply(`🔍 Fetching status from ${label}...`);
+    await sendValidatorStatus(ctx, query, network);
+    return;
+  }
+}
+
+async function subscribeConversation(conversation: MyConversation, ctx: MyContext): Promise<void> {
+  const network = await pickNetwork(conversation, ctx);
+  if (!network) return;
+
+  const query = await askValidatorName(conversation, ctx);
+  if (!query) return;
+
+  const label = NETWORK_CONFIG[network].label;
+  await ctx.reply(`🔍 Looking up validator on ${label}...`);
+
+  const matches = await findAllValidators(query, network);
+  if (matches.length === 0) {
+    await ctx.reply(`❌ Validator not found on ${label}.`, { reply_markup: mainKeyboard() });
+    return;
+  }
+
+  let v = matches[0]!;
+
+  if (matches.length > 1) {
+    const kb = new InlineKeyboard();
+    for (const m of matches.slice(0, 8)) {
+      const name = m.name ?? m.id.split("::")[0];
+      const key = storeCallback(m.party_id ?? m.id);
+      kb.text(name!, `pick:${key}`).row();
+    }
+    await ctx.reply(`🔎 Found ${matches.length} validators. Pick one:`, { reply_markup: kb });
+    const cb = await conversation.waitFor("callback_query:data");
+    await cb.answerCallbackQuery();
+    const rawKey = cb.callbackQuery.data.replace("pick:", "");
+    const pickedId = loadCallback(rawKey) ?? rawKey;
+    const found = matches.find((m) => (m.party_id ?? m.id) === pickedId);
+    if (!found) {
+      await ctx.reply("Cancelled.", { reply_markup: mainKeyboard() });
+      return;
+    }
+    v = found;
+  }
+
+  const canonical_id = v.party_id ?? v.id;
+  const name = v.name ?? v.id.split("::")[0];
+  const added = addSubscription(ctx.chat!.id, canonical_id, network);
+  const status = v.is_active ? "🟢 online" : "🔴 offline";
+
+  if (added) {
+    await ctx.reply(
+      `✅ *Subscribed* to validator on ${label}\n\n` +
+        `*Name:* ${name}\n*Status:* ${status}\n*Version:* \`${v.version ?? "unknown"}\`\n` +
+        `*ID:* \`${canonical_id}\`\n\nYou'll get alerts when status changes.\n_Note: detection delay is ~25 min (1 Canton round = 10 min)._`,
+      { parse_mode: "Markdown", reply_markup: mainKeyboard() },
+    );
+  } else {
+    await ctx.reply(`ℹ️ Already tracking *${name}* on ${label}.`, {
+      parse_mode: "Markdown",
+      reply_markup: mainKeyboard(),
+    });
+  }
+}
+
+async function unsubscribeConversation(
+  conversation: MyConversation,
+  ctx: MyContext,
+): Promise<void> {
+  const network = await pickNetwork(conversation, ctx);
+  if (!network) return;
+
+  const allSubs = getSubscriptions(ctx.chat!.id);
+  const subs = allSubs.filter((s) => s.network === network);
+  const label = NETWORK_CONFIG[network].label;
+
+  if (subs.length === 0) {
+    await ctx.reply(`📋 No subscriptions on ${label}.`, { reply_markup: mainKeyboard() });
+    return;
+  }
+
+  const kb = new InlineKeyboard();
+  for (const s of subs) {
+    const short = s.party_id.split("::")[0];
+    const key = storeCallback(s.party_id);
+    kb.text(short!, `unsub:${key}`).row();
+  }
+  kb.text("Cancel", "unsub:cancel");
+
+  await ctx.reply(`Select subscription to remove on ${label}:`, { reply_markup: kb });
+  const cb = await conversation.waitFor("callback_query:data");
+  await cb.answerCallbackQuery();
+
+  if (cb.callbackQuery.data === "unsub:cancel") {
+    await ctx.reply("Cancelled.", { reply_markup: mainKeyboard() });
+    return;
+  }
+
+  const rawKey = cb.callbackQuery.data.replace("unsub:", "");
+  const party_id = loadCallback(rawKey);
+  if (!party_id) {
+    await ctx.reply("Something went wrong.", { reply_markup: mainKeyboard() });
+    return;
+  }
+  const removed = removeSubscription(ctx.chat!.id, party_id, network);
+
+  await ctx.reply(
+    removed
+      ? `✅ Unsubscribed from \`${party_id.split("::")[0]}\` on ${label}`
+      : `ℹ️ Subscription not found.`,
     { parse_mode: "Markdown", reply_markup: mainKeyboard() },
   );
 }
 
-// ── /start & /help ────────────────────────────────────────────────────────────
+bot.use(createConversation(statusConversation, "conv_status"));
+bot.use(createConversation(subscribeConversation, "conv_subscribe"));
+bot.use(createConversation(unsubscribeConversation, "conv_unsubscribe"));
 
-bot.command("start", async (ctx) => {
-  await sendStartMessage(ctx);
+
+await bot.api.setMyCommands([
+  { command: "start", description: "Welcome message" },
+  { command: "help", description: "Show all commands" },
+  { command: "status", description: "Get validator status" },
+  { command: "track", description: "Subscribe to validator alerts" },
+  { command: "untrack", description: "Unsubscribe from validator" },
+  { command: "list", description: "List your subscriptions" },
+  { command: "network", description: "Network stats" },
+]);
+
+
+async function sendWelcome(ctx: MyContext): Promise<void> {
+  await ctx.reply(
+    `👋 *Canton Network Alert Bot*\n` +
+      `Monitor validators across MainNet, TestNet and DevNet.\n\n` +
+      `Use the buttons below or type commands directly.\n\n` +
+      `*Networks:* mainnet · testnet · devnet\n` +
+      `*Alerts:* 🔴 offline · 🟢 back online · ⚠️ outdated version`,
+    { parse_mode: "Markdown", reply_markup: mainKeyboard() },
+  );
+}
+
+bot.command("start", sendWelcome);
+bot.command("help", sendWelcome);
+
+
+bot.hears("🟢 Status", async (ctx) => {
+  await ctx.conversation.enter("conv_status");
+});
+bot.hears("➕ Subscribe", async (ctx) => {
+  await ctx.conversation.enter("conv_subscribe");
+});
+bot.hears("🗑 Unsubscribe", async (ctx) => {
+  await ctx.conversation.enter("conv_unsubscribe");
 });
 
-bot.command("help", async (ctx) => {
-  await sendStartMessage(ctx);
+bot.hears("📋 My List", async (ctx) => {
+  const subs = getSubscriptions(ctx.chat.id);
+  if (subs.length === 0) {
+    await ctx.reply("📋 No subscriptions yet.\n\nUse ➕ Subscribe to start monitoring.");
+    return;
+  }
+  const byNetwork = new Map<Network, typeof subs>();
+  for (const s of subs) {
+    const list = byNetwork.get(s.network) ?? [];
+    list.push(s);
+    byNetwork.set(s.network, list);
+  }
+  let msg = `📋 *Your subscriptions (${subs.length}):*\n`;
+  for (const net of NETWORKS) {
+    const list = byNetwork.get(net);
+    if (!list?.length) continue;
+    msg += `\n*${NETWORK_CONFIG[net].label}:*\n`;
+    for (const s of list) msg += `  • \`${s.party_id}\`\n`;
+  }
+  await ctx.reply(msg, { parse_mode: "Markdown" });
 });
 
-// ── Callback queries ──────────────────────────────────────────────────────────
+bot.hears("📊 Network Stats", async (ctx) => {
+  await ctx.reply("Select network:", { reply_markup: networkKeyboard() });
+});
+
 
 bot.callbackQuery(/^net:(mainnet|testnet|devnet)$/, async (ctx) => {
   const network = ctx.match[1] as Network;
@@ -80,7 +374,7 @@ bot.callbackQuery(/^net:(mainnet|testnet|devnet)$/, async (ctx) => {
   await ctx.reply(`🔍 Fetching ${label} stats...`);
 
   const result = await getNetworkStats(network);
-  if (!result || !result.stats) {
+  if (!result?.stats) {
     await ctx.reply(`❌ Could not fetch stats for ${label}.`);
     return;
   }
@@ -101,221 +395,116 @@ bot.callbackQuery(/^net:(mainnet|testnet|devnet)$/, async (ctx) => {
   );
 });
 
-bot.callbackQuery("cmd:list", async (ctx) => {
+
+bot.callbackQuery(/^sv:(\d+)$/, async (ctx) => {
   await ctx.answerCallbackQuery();
-  const subs = getSubscriptions(ctx.chat!.id);
-  if (subs.length === 0) {
-    await ctx.reply(`📋 No subscriptions yet.\n\nUse /track <name> to start monitoring.`);
+  const stored = loadCallback(ctx.match[1]!);
+  if (!stored) {
+    await ctx.reply("Session expired, please try again.");
     return;
   }
-  const byNetwork = new Map<Network, typeof subs>();
-  for (const s of subs) {
-    const list = byNetwork.get(s.network) ?? [];
-    list.push(s);
-    byNetwork.set(s.network, list);
-  }
-  let msg = `📋 *Your subscriptions (${subs.length}):*\n`;
-  for (const net of NETWORKS) {
-    const list = byNetwork.get(net);
-    if (!list || list.length === 0) continue;
-    msg += `\n*${NETWORK_CONFIG[net].label}:*\n`;
-    for (const s of list) {
-      msg += `  • \`${s.party_id}\`\n`;
-    }
-  }
-  await ctx.reply(msg, { parse_mode: "Markdown" });
+  const idx = stored.indexOf(":");
+  const network = stored.slice(0, idx) as Network;
+  const party_id = stored.slice(idx + 1);
+  await sendValidatorStatus(ctx, party_id, network);
 });
 
-// ── /track ────────────────────────────────────────────────────────────────────
-
-bot.command("track", async (ctx) => {
-  const args = ctx.match.trim().split(/\s+/);
-  const party_id = args[0];
-  const network: Network = parseNetwork(args[1]);
-
-  if (!party_id) {
-    await ctx.reply("Usage: /track <party_id> [mainnet|testnet|devnet]");
-    return;
-  }
-
-  const label = NETWORK_CONFIG[network].label;
-  await ctx.reply(`🔍 Looking up validator on ${label}...`);
-
-  const v = await getValidatorInfo(party_id, network);
-  if (!v) {
-    await ctx.reply(`❌ Validator not found on ${label}.\n` + `Check the party_id and network.`);
-    return;
-  }
-
-  // Use v.id as the canonical subscription key
-  const canonical_id = v.party_id ?? v.id;
-  const chat_id = ctx.chat.id;
-  const added = addSubscription(chat_id, canonical_id, network);
-  const name = v.name ?? v.id.split("::")[0];
-  const status = v.is_active ? "🟢 online" : "🔴 offline";
-
-  if (added) {
-    await ctx.reply(
-      `✅ *Subscribed* to validator on ${label}\n\n` +
-        `*Name:* ${name}\n` +
-        `*Status:* ${status}\n` +
-        `*Version:* \`${v.version ?? "unknown"}\`\n` +
-        `*ID:* \`${canonical_id}\`\n\n` +
-        `You'll get alerts when status changes.`,
-      { parse_mode: "Markdown" },
-    );
-  } else {
-    await ctx.reply(
-      `ℹ️ Already tracking this validator on ${label}.\n\n` +
-        `*Name:* ${name}\n` +
-        `*Status:* ${status}\n` +
-        `*Version:* \`${v.version ?? "unknown"}\`\n` +
-        `*ID:* \`${canonical_id}\``,
-      { parse_mode: "Markdown" },
-    );
-  }
-});
-
-// ── /untrack ──────────────────────────────────────────────────────────────────
-
-bot.command("untrack", async (ctx) => {
-  const args = ctx.match.trim().split(/\s+/);
-  const party_id = args[0];
-  const network: Network = parseNetwork(args[1]);
-
-  if (!party_id) {
-    await ctx.reply("Usage: /untrack <party_id> [mainnet|testnet|devnet]");
-    return;
-  }
-
-  const removed = removeSubscription(ctx.chat.id, party_id, network);
-  const label = NETWORK_CONFIG[network].label;
-
-  if (removed) {
-    await ctx.reply(`✅ Unsubscribed from \`${party_id}\` on ${label}`, {
-      parse_mode: "Markdown",
-    });
-  } else {
-    await ctx.reply(`ℹ️ No subscription found for \`${party_id}\` on ${label}`, {
-      parse_mode: "Markdown",
-    });
-  }
-});
-
-// ── /status ───────────────────────────────────────────────────────────────────
 
 bot.command("status", async (ctx) => {
   const args = ctx.match.trim().split(/\s+/);
   const query = args[0];
   const network: Network = parseNetwork(args[1]);
-
   if (!query) {
-    await ctx.reply("Usage: /status <name or id> [mainnet|testnet|devnet]");
+    await ctx.reply("Usage: /status <name> [mainnet|testnet|devnet]");
     return;
   }
+  await ctx.reply(`🔍 Fetching status from ${NETWORK_CONFIG[network].label}...`);
+  await sendValidatorStatus(ctx, query, network);
+});
 
+bot.command("track", async (ctx) => {
+  const args = ctx.match.trim().split(/\s+/);
+  const party_id = args[0];
+  const network: Network = parseNetwork(args[1]);
+  if (!party_id) {
+    await ctx.reply("Usage: /track <name> [mainnet|testnet|devnet]");
+    return;
+  }
   const label = NETWORK_CONFIG[network].label;
-  await ctx.reply(`🔍 Fetching status from ${label}...`);
-
-  const matches = await findAllValidators(query, network);
-
-  if (matches.length === 0) {
-    await ctx.reply(
-      `❌ Validator not found on ${label}.\n\nTry searching by name or partial ID, e.g.:\n\`/status web34ever mainnet\``,
-    );
+  await ctx.reply(`🔍 Looking up validator on ${label}...`);
+  const v = await getValidatorInfo(party_id, network);
+  if (!v) {
+    await ctx.reply(`❌ Validator not found on ${label}.`);
     return;
   }
-
-  // Multiple matches — show list to pick from
-  if (matches.length > 1) {
-    let msg = `🔎 *Found ${matches.length} validators on ${label}:*\n\n`;
-    for (const v of matches.slice(0, 10)) {
-      const name = v.name ?? v.id.split("::")[0];
-      const status = v.is_active ? "🟢" : "🔴";
-      msg += `${status} *${name}* — v\`${v.version ?? "?"}\`\n`;
-      msg += `  \`${v.id.split("::")[0]}\`\n\n`;
-    }
-    msg += `Use the full name for exact match, e.g.:\n\`/status ${matches[0].id.split("::")[0]} ${network}\``;
-    await ctx.reply(msg, { parse_mode: "Markdown" });
-    return;
-  }
-
-  const v = matches[0]!;
   const canonical_id = v.party_id ?? v.id;
+  const added = addSubscription(ctx.chat.id, canonical_id, network);
   const name = v.name ?? v.id.split("::")[0];
-  const status = v.is_active ? "🟢 Online" : "🔴 Offline";
-  const lastSeen = v.last_seen_at ? new Date(v.last_seen_at).toUTCString() : "unknown";
-  const firstSeen = v.first_seen_at ? new Date(v.first_seen_at).toUTCString() : "unknown";
+  const status = v.is_active ? "🟢 online" : "🔴 offline";
+  if (added) {
+    await ctx.reply(
+      `✅ *Subscribed* to validator on ${label}\n\n*Name:* ${name}\n*Status:* ${status}\n*ID:* \`${canonical_id}\`\n\nYou'll get alerts when status changes.\n_Note: detection delay is ~25 min (1 Canton round = 10 min)._`,
+      { parse_mode: "Markdown" },
+    );
+  } else {
+    await ctx.reply(`ℹ️ Already tracking *${name}* on ${label}.`, { parse_mode: "Markdown" });
+  }
+});
 
+bot.command("untrack", async (ctx) => {
+  const args = ctx.match.trim().split(/\s+/);
+  const party_id = args[0];
+  const network: Network = parseNetwork(args[1]);
+  if (!party_id) {
+    await ctx.reply("Usage: /untrack <party_id> [mainnet|testnet|devnet]");
+    return;
+  }
+  const removed = removeSubscription(ctx.chat.id, party_id, network);
+  const label = NETWORK_CONFIG[network].label;
   await ctx.reply(
-    `*[${label}] Validator Status*\n\n` +
-      `*Name:* ${name}\n` +
-      `*Status:* ${status}\n` +
-      `*Version:* \`${v.version ?? "unknown"}\`\n` +
-      `*Last seen:* ${lastSeen}\n` +
-      `*First seen:* ${firstSeen}\n` +
-      `*ID:* \`${canonical_id}\``,
+    removed ? `✅ Unsubscribed from \`${party_id}\` on ${label}` : `ℹ️ No subscription found.`,
     { parse_mode: "Markdown" },
   );
 });
 
-// ── /list ─────────────────────────────────────────────────────────────────────
-
 bot.command("list", async (ctx) => {
   const subs = getSubscriptions(ctx.chat.id);
-
   if (subs.length === 0) {
-    await ctx.reply(
-      `📋 No subscriptions yet.\n\nUse /track <party_id> to start monitoring a validator.`,
-    );
+    await ctx.reply("📋 No subscriptions yet.\n\nUse /track <party_id> to start monitoring.");
     return;
   }
-
   const byNetwork = new Map<Network, typeof subs>();
   for (const s of subs) {
     const list = byNetwork.get(s.network) ?? [];
     list.push(s);
     byNetwork.set(s.network, list);
   }
-
   let msg = `📋 *Your subscriptions (${subs.length}):*\n`;
   for (const net of NETWORKS) {
     const list = byNetwork.get(net);
-    if (!list || list.length === 0) continue;
+    if (!list?.length) continue;
     msg += `\n*${NETWORK_CONFIG[net].label}:*\n`;
-    for (const s of list) {
-      msg += `  • \`${s.party_id}\`\n`;
-    }
+    for (const s of list) msg += `  • \`${s.party_id}\`\n`;
   }
-  msg += `\nUse /status <party\\_id> [network] to check current status.`;
-
   await ctx.reply(msg, { parse_mode: "Markdown" });
 });
-
-// ── /network ──────────────────────────────────────────────────────────────────
 
 bot.command("network", async (ctx) => {
   const network: Network = parseNetwork(ctx.match.trim() || undefined);
   const label = NETWORK_CONFIG[network].label;
-
   await ctx.reply(`🔍 Fetching ${label} stats...`);
-
   const result = await getNetworkStats(network);
-  if (!result || !result.stats) {
+  if (!result?.stats) {
     await ctx.reply(`❌ Could not fetch stats for ${label}.`);
     return;
   }
-
   const { stats, source } = result;
   const price = stats.cc_price !== undefined ? Number(stats.cc_price).toFixed(4) : "unknown";
   const validators = stats.total_validator ?? stats.total_validators ?? "unknown";
   const rounds = extractRoundNumber(stats);
-
   await ctx.reply(
     `📊 *${label} Network Stats*\n\n` +
-      `*Validators:* ${validators}\n` +
-      `*Latest round:* ${rounds}\n` +
-      `*CC Price:* $${price}\n` +
+      `*Validators:* ${validators}\n*Latest round:* ${rounds}\n*CC Price:* $${price}\n` +
       `*Version:* \`${stats.version ?? "unknown"}\`\n` +
       (stats.total_parties ? `*Parties:* ${stats.total_parties}\n` : "") +
       (stats.total_transaction ? `*Transactions:* ${stats.total_transaction}\n` : "") +
@@ -324,15 +513,40 @@ bot.command("network", async (ctx) => {
   );
 });
 
-// ── Error handler ─────────────────────────────────────────────────────────────
+
+bot.command("admin", async (ctx) => {
+  if (!ADMIN_CHAT_ID || ctx.chat.id !== ADMIN_CHAT_ID) {
+    await ctx.reply("⛔ Not authorized.");
+    return;
+  }
+  const users = getUniqueUsersCount();
+  const subs = getSubscriptionsCount();
+  const byNetwork = getSubscriptionsByNetwork();
+  const alerts24h = getAlertCount24h();
+  const pollStatus = NETWORKS.map((net) => {
+    const last = lastPollOk[net];
+    const ago = last ? `${Math.floor((Date.now() - last.getTime()) / 60000)}m ago` : "never";
+    return `  ${NETWORK_CONFIG[net].label}: ${ago}`;
+  }).join("\n");
+  await ctx.reply(
+    `🛠 *Bot Admin Stats*\n\n` +
+      `*Users:* ${users}\n*Subscriptions:* ${subs}\n` +
+      `  mainnet: ${byNetwork["mainnet"] ?? 0}\n` +
+      `  testnet: ${byNetwork["testnet"] ?? 0}\n` +
+      `  devnet: ${byNetwork["devnet"] ?? 0}\n\n` +
+      `*Alerts sent (24h):* ${alerts24h}\n\n` +
+      `*Last poll:*\n${pollStatus}`,
+    { parse_mode: "Markdown" },
+  );
+});
+
 
 bot.catch((err) => {
   console.error("[bot] error:", err.message);
 });
 
-// ── Start ─────────────────────────────────────────────────────────────────────
 
-startMonitor(bot);
+startMonitor(bot as unknown as Bot);
 
 bot.start({
   onStart: () => console.log("[bot] started and polling"),

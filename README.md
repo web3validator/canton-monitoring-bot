@@ -2,22 +2,35 @@
 
 Telegram bot for monitoring Canton Network validators across MainNet, TestNet and DevNet.
 
+**[@canton_monitoring_bot](https://t.me/canton_monitoring_bot)**
+
+## Demo
+
+<p align="center">
+  <img src="images/demo.png" width="340" alt="Bot start screen" />
+  <img src="images/demo2.png" width="340" alt="Track validator" />
+</p>
+
 ## Features
 
-- Track validators by party_id per network
+- Track validators by name or partial party_id
+- Persistent reply keyboard — buttons always visible
 - Alerts: offline, back online, outdated version
-- Fallback data sources (our indexer → Lighthouse direct)
+- Uptime 7d shown in validator status
+- Fallback data sources: our indexer → Lighthouse
 - Per-network support: mainnet / testnet / devnet
 
-## Commands
+## Usage
 
-| Command | Description |
-|---------|-------------|
-| `/track <party_id> [network]` | Subscribe to validator alerts |
-| `/untrack <party_id> [network]` | Unsubscribe |
-| `/status <party_id> [network]` | Current validator status |
-| `/list` | All your subscriptions |
-| `/network [mainnet\|testnet\|devnet]` | Network stats |
+Use the buttons or type commands directly:
+
+| Button / Command | Description |
+|------------------|-------------|
+| 🟢 Status / `/status <name> [network]` | Current validator status + uptime |
+| ➕ Subscribe / `/track <name> [network]` | Subscribe to alerts |
+| 🗑 Unsubscribe / `/untrack <name> [network]` | Unsubscribe |
+| 📋 My List / `/list` | All your subscriptions |
+| 📊 Network Stats / `/network [network]` | Network stats |
 
 Default network: **mainnet**
 
@@ -25,12 +38,13 @@ Default network: **mainnet**
 
 | Trigger | Message |
 |---------|---------|
-| `is_active = false` | 🔴 Validator offline |
-| `last_seen_at > 30m` | 🔴 Validator offline (stale) |
+| Validator inactive > 25 min | 🔴 Validator offline |
 | Validator recovered | 🟢 Validator back online |
 | Version behind network | ⚠️ Outdated version |
 
-## Data Sources (with fallback)
+> Detection delay is ~25 min — Canton round = 10 min, status updates once per round.
+
+## Data Sources
 
 | Network | Primary | Fallback |
 |---------|---------|----------|
@@ -48,7 +62,7 @@ Talk to [@BotFather](https://t.me/BotFather) and get a `BOT_TOKEN`.
 
 ```bash
 cp .env.example .env
-# Edit .env and set BOT_TOKEN
+# Edit .env — set BOT_TOKEN and optionally ADMIN_CHAT_ID
 
 docker compose up -d --build
 ```
@@ -66,20 +80,21 @@ BOT_TOKEN=your_token node dist/bot.js
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `BOT_TOKEN` | ✅ | Telegram bot token from @BotFather |
+| `ADMIN_CHAT_ID` | — | Your Telegram chat ID for admin alerts and `/admin` command |
 | `DB_PATH` | — | SQLite database path (default: `./data/bot.db`) |
 
 ## Architecture
 
 ```
-Telegram ←→ grammy bot
+Telegram ←→ grammy bot (conversations plugin)
               ↓
-          monitor.ts (polling every 60s)
+          monitor.ts (polling every 5 min)
               ↓
           fetchWithFallback()
               ↓
      [our indexer] → [lighthouse direct]
               ↓
-          SQLite (subscriptions + validator state cache)
+          SQLite (subscriptions + validator state + alert log)
 ```
 
 ## Repository

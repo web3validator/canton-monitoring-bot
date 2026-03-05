@@ -7,6 +7,7 @@ export interface NetworkConfig {
   label: string;
   endpoints: string[]; // primary first, then fallbacks
   lighthouseUrl: string; // direct lighthouse (always public)
+  indexerUrl: string;
 }
 
 export const NETWORK_CONFIG: Record<Network, NetworkConfig> = {
@@ -18,6 +19,7 @@ export const NETWORK_CONFIG: Record<Network, NetworkConfig> = {
       "https://lighthouse.cantonloop.com",
     ],
     lighthouseUrl: "https://lighthouse.cantonloop.com",
+    indexerUrl: "https://mainnet-canton-indexer.web34ever.com",
   },
   testnet: {
     name: "testnet",
@@ -27,6 +29,7 @@ export const NETWORK_CONFIG: Record<Network, NetworkConfig> = {
       "https://lighthouse.testnet.cantonloop.com",
     ],
     lighthouseUrl: "https://lighthouse.testnet.cantonloop.com",
+    indexerUrl: "https://testnet-canton-indexer.web34ever.com",
   },
   devnet: {
     name: "devnet",
@@ -36,6 +39,7 @@ export const NETWORK_CONFIG: Record<Network, NetworkConfig> = {
       "https://lighthouse.devnet.cantonloop.com",
     ],
     lighthouseUrl: "https://lighthouse.devnet.cantonloop.com",
+    indexerUrl: "https://devnet-canton-indexer.web34ever.com",
   },
 };
 
