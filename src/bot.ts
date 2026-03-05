@@ -43,10 +43,8 @@ type MyConversation = Conversation<MyContext, MyContext>;
 
 export const bot = new Bot<MyContext>(BOT_TOKEN);
 
-
 bot.use(session<SessionData, MyContext>({ initial: () => ({}) }));
 bot.use(conversations());
-
 
 function mainKeyboard(): Keyboard {
   return new Keyboard()
@@ -65,9 +63,10 @@ function networkKeyboard(): InlineKeyboard {
   return new InlineKeyboard()
     .text("MainNet", "net:mainnet")
     .text("TestNet", "net:testnet")
-    .text("DevNet", "net:devnet");
+    .text("DevNet", "net:devnet")
+    .row()
+    .text("❌ Cancel", "net:cancel");
 }
-
 
 const callbackCache = new Map<string, string>();
 let callbackCounter = 0;
@@ -81,7 +80,6 @@ function storeCallback(value: string): string {
 function loadCallback(key: string): string | undefined {
   return callbackCache.get(key);
 }
-
 
 async function fetchUptime(party_id: string, network: Network): Promise<string> {
   const cfg = NETWORK_CONFIG[network];
@@ -154,21 +152,74 @@ async function askValidatorName(
   ];
   await ctx.reply("Enter validator name or ID:", { reply_markup: mainKeyboard() });
   while (true) {
-    const msg = await conversation.waitFor("message:text");
+    const msg = await conversation.waitFor("message:text", {
+      maxMilliseconds: 120 * 1000,
+      otherwise: async (ctx) => {
+        if (ctx.callbackQuery) await ctx.answerCallbackQuery().catch(() => {});
+      },
+    });
+    if (!msg) {
+      await ctx.reply("❌ Cancelled (timed out).", { reply_markup: mainKeyboard() });
+      return null;
+    }
     const text = msg.message.text.trim();
-    if (!buttonTexts.includes(text)) return text || null;
+    if (text === "/cancel") {
+      await ctx.reply("❌ Cancelled.", { reply_markup: mainKeyboard() });
+      return null;
+    }
+    if (buttonTexts.includes(text)) {
+      await ctx.reply("❌ Cancelled. Press the button again.", { reply_markup: mainKeyboard() });
+      return null;
+    }
+    return text || null;
   }
 }
 
 async function pickNetwork(conversation: MyConversation, ctx: MyContext): Promise<Network | null> {
-  await ctx.reply("Select network:", { reply_markup: networkKeyboard() });
-  const cb = await conversation.waitFor("callback_query:data");
-  const match = cb.callbackQuery.data.match(/^net:(mainnet|testnet|devnet)$/);
-  await cb.answerCallbackQuery();
-  if (!match) return null;
-  return match[1] as Network;
+  const sent = await ctx.reply("Select network:", { reply_markup: networkKeyboard() });
+  const editSent = async (text: string) => {
+    await ctx.api.editMessageText(sent.chat.id, sent.message_id, text).catch(() => {});
+  };
+  while (true) {
+    const upd = await conversation.wait({
+      maxMilliseconds: 120 * 1000,
+    });
+    if (!upd) {
+      await editSent("Select network: ❌ Cancelled (timed out).");
+      await ctx.reply("❌ Cancelled (timed out).", { reply_markup: mainKeyboard() });
+      return null;
+    }
+    const menuButtons = [
+      "🟢 Status",
+      "➕ Subscribe",
+      "🗑 Unsubscribe",
+      "📋 My List",
+      "📊 Network Stats",
+    ];
+    if (
+      upd.message?.text === "/cancel" ||
+      (upd.message?.text && menuButtons.includes(upd.message.text))
+    ) {
+      await editSent("Select network: ❌ Cancelled.");
+      await upd.reply("❌ Cancelled. Press the button again.", { reply_markup: mainKeyboard() });
+      return null;
+    }
+    const data = upd.callbackQuery?.data;
+    if (!data) continue;
+    await upd.answerCallbackQuery().catch(() => {});
+    if (data === "net:cancel") {
+      await editSent("Select network: ❌ Cancelled.");
+      await upd.reply("❌ Cancelled.", { reply_markup: mainKeyboard() });
+      return null;
+    }
+    const match = data.match(/^net:(mainnet|testnet|devnet)$/);
+    if (match) {
+      const label = NETWORK_CONFIG[match[1] as Network].label;
+      await editSent(`Network: ✅ ${label}`);
+      return match[1] as Network;
+    }
+  }
 }
-
 
 async function statusConversation(conversation: MyConversation, ctx: MyContext): Promise<void> {
   const network = await pickNetwork(conversation, ctx);
@@ -217,16 +268,25 @@ async function subscribeConversation(conversation: MyConversation, ctx: MyContex
       const key = storeCallback(m.party_id ?? m.id);
       kb.text(name!, `pick:${key}`).row();
     }
-    await ctx.reply(`🔎 Found ${matches.length} validators. Pick one:`, { reply_markup: kb });
+    const sentPick = await ctx.reply(`🔎 Found ${matches.length} validators. Pick one:`, {
+      reply_markup: kb,
+    });
     const cb = await conversation.waitFor("callback_query:data");
     await cb.answerCallbackQuery();
     const rawKey = cb.callbackQuery.data.replace("pick:", "");
     const pickedId = loadCallback(rawKey) ?? rawKey;
     const found = matches.find((m) => (m.party_id ?? m.id) === pickedId);
     if (!found) {
+      await ctx.api
+        .editMessageText(sentPick.chat.id, sentPick.message_id, "🔎 Pick validator: ❌ Cancelled.")
+        .catch(() => {});
       await ctx.reply("Cancelled.", { reply_markup: mainKeyboard() });
       return;
     }
+    const pickedName = found.name ?? found.id.split("::")[0];
+    await ctx.api
+      .editMessageText(sentPick.chat.id, sentPick.message_id, `🔎 Pick validator: ✅ ${pickedName}`)
+      .catch(() => {});
     v = found;
   }
 
@@ -274,12 +334,21 @@ async function unsubscribeConversation(
   }
   kb.text("Cancel", "unsub:cancel");
 
-  await ctx.reply(`Select subscription to remove on ${label}:`, { reply_markup: kb });
+  const sentUnsub = await ctx.reply(`Select subscription to remove on ${label}:`, {
+    reply_markup: kb,
+  });
   const cb = await conversation.waitFor("callback_query:data");
   await cb.answerCallbackQuery();
 
   if (cb.callbackQuery.data === "unsub:cancel") {
-    await ctx.reply("Cancelled.", { reply_markup: mainKeyboard() });
+    await ctx.api
+      .editMessageText(
+        sentUnsub.chat.id,
+        sentUnsub.message_id,
+        `Select subscription to remove on ${label}: ❌ Cancelled.`,
+      )
+      .catch(() => {});
+    await ctx.reply("❌ Cancelled.", { reply_markup: mainKeyboard() });
     return;
   }
 
@@ -290,19 +359,25 @@ async function unsubscribeConversation(
     return;
   }
   const removed = removeSubscription(ctx.chat!.id, party_id, network);
+  const shortName = party_id.split("::")[0];
+  await ctx.api
+    .editMessageText(
+      sentUnsub.chat.id,
+      sentUnsub.message_id,
+      `Select subscription to remove on ${label}: ✅ ${shortName}`,
+    )
+    .catch(() => {});
 
   await ctx.reply(
-    removed
-      ? `✅ Unsubscribed from \`${party_id.split("::")[0]}\` on ${label}`
-      : `ℹ️ Subscription not found.`,
+    removed ? `✅ Unsubscribed from \`${shortName}\` on ${label}` : `ℹ️ Subscription not found.`,
     { parse_mode: "Markdown", reply_markup: mainKeyboard() },
   );
 }
 
-bot.use(createConversation(statusConversation, "conv_status"));
-bot.use(createConversation(subscribeConversation, "conv_subscribe"));
-bot.use(createConversation(unsubscribeConversation, "conv_unsubscribe"));
-
+const CONV_TIMEOUT = { maxMillisecondsToWait: 120 * 1000 };
+bot.use(createConversation(statusConversation, { id: "conv_status", ...CONV_TIMEOUT }));
+bot.use(createConversation(subscribeConversation, { id: "conv_subscribe", ...CONV_TIMEOUT }));
+bot.use(createConversation(unsubscribeConversation, { id: "conv_unsubscribe", ...CONV_TIMEOUT }));
 
 await bot.api.setMyCommands([
   { command: "start", description: "Welcome message" },
@@ -312,8 +387,8 @@ await bot.api.setMyCommands([
   { command: "untrack", description: "Unsubscribe from validator" },
   { command: "list", description: "List your subscriptions" },
   { command: "network", description: "Network stats" },
+  { command: "cancel", description: "Cancel current action" },
 ]);
-
 
 async function sendWelcome(ctx: MyContext): Promise<void> {
   await ctx.reply(
@@ -329,14 +404,27 @@ async function sendWelcome(ctx: MyContext): Promise<void> {
 bot.command("start", sendWelcome);
 bot.command("help", sendWelcome);
 
+async function exitAllConversations(ctx: MyContext): Promise<void> {
+  await ctx.conversation.exit("conv_status");
+  await ctx.conversation.exit("conv_subscribe");
+  await ctx.conversation.exit("conv_unsubscribe");
+}
+
+bot.command("cancel", async (ctx) => {
+  await exitAllConversations(ctx);
+  await ctx.reply("❌ Cancelled.", { reply_markup: mainKeyboard() });
+});
 
 bot.hears("🟢 Status", async (ctx) => {
+  await exitAllConversations(ctx);
   await ctx.conversation.enter("conv_status");
 });
 bot.hears("➕ Subscribe", async (ctx) => {
+  await exitAllConversations(ctx);
   await ctx.conversation.enter("conv_subscribe");
 });
 bot.hears("🗑 Unsubscribe", async (ctx) => {
+  await exitAllConversations(ctx);
   await ctx.conversation.enter("conv_unsubscribe");
 });
 
@@ -366,6 +454,10 @@ bot.hears("📊 Network Stats", async (ctx) => {
   await ctx.reply("Select network:", { reply_markup: networkKeyboard() });
 });
 
+bot.callbackQuery("net:cancel", async (ctx) => {
+  await ctx.answerCallbackQuery();
+  await ctx.reply("❌ Cancelled.", { reply_markup: mainKeyboard() });
+});
 
 bot.callbackQuery(/^net:(mainnet|testnet|devnet)$/, async (ctx) => {
   const network = ctx.match[1] as Network;
@@ -395,7 +487,6 @@ bot.callbackQuery(/^net:(mainnet|testnet|devnet)$/, async (ctx) => {
   );
 });
 
-
 bot.callbackQuery(/^sv:(\d+)$/, async (ctx) => {
   await ctx.answerCallbackQuery();
   const stored = loadCallback(ctx.match[1]!);
@@ -408,7 +499,6 @@ bot.callbackQuery(/^sv:(\d+)$/, async (ctx) => {
   const party_id = stored.slice(idx + 1);
   await sendValidatorStatus(ctx, party_id, network);
 });
-
 
 bot.command("status", async (ctx) => {
   const args = ctx.match.trim().split(/\s+/);
@@ -513,7 +603,6 @@ bot.command("network", async (ctx) => {
   );
 });
 
-
 bot.command("admin", async (ctx) => {
   if (!ADMIN_CHAT_ID || ctx.chat.id !== ADMIN_CHAT_ID) {
     await ctx.reply("⛔ Not authorized.");
@@ -540,11 +629,16 @@ bot.command("admin", async (ctx) => {
   );
 });
 
-
 bot.catch((err) => {
-  console.error("[bot] error:", err.message);
+  console.error("[bot] error:", err.message, err.error);
+  if (ADMIN_CHAT_ID) {
+    bot.api
+      .sendMessage(ADMIN_CHAT_ID, `⚠️ *[Bot] Error*\n\`${err.message}\``, {
+        parse_mode: "Markdown",
+      })
+      .catch(() => {});
+  }
 });
-
 
 startMonitor(bot as unknown as Bot);
 
