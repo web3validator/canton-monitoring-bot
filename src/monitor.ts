@@ -26,6 +26,7 @@ async function notifyAdmin(bot: Bot, msg: string): Promise<void> {
 
 const POLL_INTERVAL_MS = 5 * 60_000;
 const OFFLINE_THRESHOLD_MS = 25 * 60 * 1000;
+const POLL_NETWORK_TIMEOUT_MS = 30_000;
 
 const dominantVersionCache: Partial<Record<Network, string>> = {};
 
@@ -48,32 +49,67 @@ function getDominantVersion(validators: Validator[]): string | null {
   return sorted[0]?.[0] ?? null;
 }
 
+/** Canonical ID: use party_id if present, otherwise id */
+function canonicalId(v: Validator): string {
+  return v.party_id ?? v.id;
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    promise.then(
+      (val) => {
+        clearTimeout(timer);
+        resolve(val);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
+
 async function pollNetwork(bot: Bot, network: Network): Promise<void> {
   const cfg = NETWORK_CONFIG[network];
+  console.log(`[monitor] polling ${network}...`);
 
   const result = await fetchWithFallback<ValidatorsResponse>(
     "/api/validators?page_size=5000",
     network,
   );
-  if (!result) return;
+  if (!result) {
+    console.warn(`[monitor] ${network}: no data from indexer/lighthouse`);
+    return;
+  }
 
   const validators = result.data.data ?? result.data.validators ?? [];
-  if (validators.length === 0) return;
+  if (validators.length === 0) {
+    console.warn(`[monitor] ${network}: empty validators list`);
+    return;
+  }
 
   const dominant = getDominantVersion(validators);
   if (dominant) dominantVersionCache[network] = dominant;
 
+  // Build lookup map by both party_id and id
   const validatorMap = new Map<string, Validator>();
   for (const v of validators) {
-    if (v.party_id) validatorMap.set(v.party_id, v);
     validatorMap.set(v.id, v);
+    if (v.party_id) validatorMap.set(v.party_id, v);
   }
 
   const tracked = getTrackedValidators().filter((t) => t.network === network);
+  let alertsSent = 0;
 
   for (const { party_id } of tracked) {
     const v = validatorMap.get(party_id);
-    if (!v) continue;
+    if (!v) {
+      console.log(
+        `[monitor] ${network}: tracked validator not found in API: ${party_id.slice(0, 40)}...`,
+      );
+      continue;
+    }
 
     const prevState = getValidatorState(party_id, network);
     const isActive = v.is_active ?? false;
@@ -89,30 +125,50 @@ async function pollNetwork(bot: Bot, network: Network): Promise<void> {
     if (subscribers.length === 0) continue;
 
     const label = cfg.label;
-    const name = v.name ?? party_id.slice(0, 20) + "…";
+    const name = v.name ?? v.id.split("::")[0] ?? party_id.slice(0, 20) + "…";
 
-    if (prevState && prevState.is_active === 1 && !effectivelyActive) {
-      const reason = !isActive ? "is_active = false" : `not seen for ${formatLastSeen(lastSeenAt)}`;
+    // ── Offline alert: transition 1→0 OR first seen as offline ──
+    const wentOffline = prevState && prevState.is_active === 1 && !effectivelyActive;
+    const firstSeenOffline = !prevState && !effectivelyActive;
+
+    if (wentOffline || firstSeenOffline) {
+      const reason = !isActive
+        ? "is_active = false"
+        : stale
+          ? `not seen for ${formatLastSeen(lastSeenAt)}`
+          : "offline";
       const msg =
         `🔴 *[${label}] Validator offline*\n` +
         `*${name}*\n` +
         `Reason: ${reason}\n` +
         `Party: \`${party_id}\``;
+      console.log(
+        `[monitor] ALERT offline: ${name} on ${network} (${firstSeenOffline ? "first-seen" : "transition"})`,
+      );
       for (const chat_id of subscribers) {
-        await bot.api.sendMessage(chat_id, msg, { parse_mode: "Markdown" }).catch(() => {});
+        await bot.api.sendMessage(chat_id, msg, { parse_mode: "Markdown" }).catch((err) => {
+          console.error(`[monitor] failed to send offline alert to ${chat_id}:`, err);
+        });
         logAlert(chat_id, party_id, network, "offline");
+        alertsSent++;
       }
     }
 
+    // ── Back online alert: transition 0→1 ──
     if (prevState && prevState.is_active === 0 && effectivelyActive) {
       const msg =
         `🟢 *[${label}] Validator back online*\n` + `*${name}*\n` + `Party: \`${party_id}\``;
+      console.log(`[monitor] ALERT online: ${name} on ${network}`);
       for (const chat_id of subscribers) {
-        await bot.api.sendMessage(chat_id, msg, { parse_mode: "Markdown" }).catch(() => {});
+        await bot.api.sendMessage(chat_id, msg, { parse_mode: "Markdown" }).catch((err) => {
+          console.error(`[monitor] failed to send online alert to ${chat_id}:`, err);
+        });
         logAlert(chat_id, party_id, network, "online");
+        alertsSent++;
       }
     }
 
+    // ── Version alert ──
     const dom = dominantVersionCache[network];
     if (dom && v.version && v.version !== dom) {
       const prevVersion = prevState?.version;
@@ -122,12 +178,20 @@ async function pollNetwork(bot: Bot, network: Network): Promise<void> {
         `*${name}*\n` +
         `Version: \`${v.version}\` (network: \`${dom}\`)\n` +
         `Party: \`${party_id}\``;
+      console.log(`[monitor] ALERT version: ${name} on ${network}: ${v.version} vs ${dom}`);
       for (const chat_id of subscribers) {
-        await bot.api.sendMessage(chat_id, msg, { parse_mode: "Markdown" }).catch(() => {});
+        await bot.api.sendMessage(chat_id, msg, { parse_mode: "Markdown" }).catch((err) => {
+          console.error(`[monitor] failed to send version alert to ${chat_id}:`, err);
+        });
         logAlert(chat_id, party_id, network, "version");
+        alertsSent++;
       }
     }
   }
+
+  console.log(
+    `[monitor] ${network} done: ${validators.length} validators, ${tracked.length} tracked, ${alertsSent} alerts sent`,
+  );
 }
 
 export async function getValidatorInfo(query: string, network: Network): Promise<Validator | null> {
@@ -170,11 +234,19 @@ export const lastPollOk: Partial<Record<Network, Date>> = {};
 
 export function startMonitor(bot: Bot): void {
   console.log("[monitor] starting polling for networks:", NETWORKS.join(", "));
+  console.log(
+    `[monitor] poll interval: ${POLL_INTERVAL_MS / 1000}s, offline threshold: ${OFFLINE_THRESHOLD_MS / 1000}s, poll timeout: ${POLL_NETWORK_TIMEOUT_MS / 1000}s`,
+  );
 
   const poll = async () => {
+    console.log(`[monitor] === poll cycle start ===`);
     for (const network of NETWORKS) {
       try {
-        await pollNetwork(bot, network);
+        await withTimeout(
+          pollNetwork(bot, network),
+          POLL_NETWORK_TIMEOUT_MS,
+          `pollNetwork(${network})`,
+        );
         lastPollOk[network] = new Date();
       } catch (err) {
         console.error(`[monitor] error polling ${network}:`, err);
@@ -184,6 +256,7 @@ export function startMonitor(bot: Bot): void {
         await notifyAdmin(bot, msg);
       }
     }
+    console.log(`[monitor] === poll cycle end ===`);
   };
 
   setTimeout(() => {

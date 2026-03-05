@@ -8,8 +8,6 @@ const DB_PATH = process.env["DB_PATH"] ?? path.join(__dirname, "../../data/bot.d
 
 const db = new Database(DB_PATH);
 
-db.exec(`DROP TABLE IF EXISTS validator_state;`);
-
 db.exec(`
   CREATE TABLE IF NOT EXISTS subscriptions (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -57,7 +55,6 @@ export interface ValidatorState {
   updated_at: string;
 }
 
-
 export function addSubscription(chat_id: number, party_id: string, network: Network): boolean {
   try {
     db.prepare(`INSERT INTO subscriptions (chat_id, party_id, network) VALUES (?, ?, ?)`).run(
@@ -102,7 +99,6 @@ export function getTrackedValidators(): { party_id: string; network: Network }[]
   }[];
 }
 
-
 export function getValidatorState(party_id: string, network: Network): ValidatorState | null {
   return (
     (db
@@ -110,7 +106,6 @@ export function getValidatorState(party_id: string, network: Network): Validator
       .get(party_id, network) as ValidatorState | undefined) ?? null
   );
 }
-
 
 export function logAlert(chat_id: number, party_id: string, network: Network, type: string): void {
   db.prepare(`INSERT INTO alert_log (chat_id, party_id, network, type) VALUES (?, ?, ?, ?)`).run(
