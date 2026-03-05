@@ -1,0 +1,14 @@
+services:
+  canton-alert-bot:
+    build: .
+    container_name: canton-alert-bot
+    restart: unless-stopped
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      DB_PATH: /data/bot.db
+      NODE_ENV: production
+    volumes:
+      - bot_data:/data
+
+volumes:
+  bot_data:

@@ -1,0 +1,23 @@
+{
+  "name": "canton-alert-bot",
+  "version": "1.0.0",
+  "description": "Canton Network validator monitoring Telegram bot",
+  "type": "module",
+  "main": "dist/bot.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/bot.js",
+    "dev": "tsx watch src/bot.ts"
+  },
+  "dependencies": {
+    "grammy": "^1.30.0",
+    "better-sqlite3": "^9.4.3",
+    "undici": "^6.19.2"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.8",
+    "@types/node": "^20.0.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.4.0"
+  }
+}
