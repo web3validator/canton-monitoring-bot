@@ -3,8 +3,9 @@ services:
     build: .
     container_name: canton-alert-bot
     restart: unless-stopped
+    env_file:
+      - .env
     environment:
-      BOT_TOKEN: ${BOT_TOKEN}
       DB_PATH: /data/bot.db
       NODE_ENV: production
     volumes:

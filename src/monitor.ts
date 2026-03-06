@@ -15,6 +15,7 @@ import {
   getValidatorState,
   upsertValidatorState,
   logAlert,
+  getLastAlertType,
 } from "./db.js";
 
 const ADMIN_CHAT_ID = process.env["ADMIN_CHAT_ID"] ? Number(process.env["ADMIN_CHAT_ID"]) : null;
@@ -160,6 +161,11 @@ async function pollNetwork(bot: Bot, network: Network): Promise<void> {
         `🟢 *[${label}] Validator back online*\n` + `*${name}*\n` + `Party: \`${party_id}\``;
       console.log(`[monitor] ALERT online: ${name} on ${network}`);
       for (const chat_id of subscribers) {
+        const lastAlert = getLastAlertType(chat_id, party_id, network);
+        if (lastAlert === "online") {
+          console.log(`[monitor] skip duplicate online alert for ${name} (${chat_id})`);
+          continue;
+        }
         await bot.api.sendMessage(chat_id, msg, { parse_mode: "Markdown" }).catch((err) => {
           console.error(`[monitor] failed to send online alert to ${chat_id}:`, err);
         });

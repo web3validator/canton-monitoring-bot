@@ -107,6 +107,19 @@ export function getValidatorState(party_id: string, network: Network): Validator
   );
 }
 
+export function getLastAlertType(
+  chat_id: number,
+  party_id: string,
+  network: Network,
+): string | null {
+  const row = db
+    .prepare(
+      `SELECT type FROM alert_log WHERE chat_id = ? AND party_id = ? AND network = ? ORDER BY sent_at DESC LIMIT 1`,
+    )
+    .get(chat_id, party_id, network) as { type: string } | undefined;
+  return row?.type ?? null;
+}
+
 export function logAlert(chat_id: number, party_id: string, network: Network, type: string): void {
   db.prepare(`INSERT INTO alert_log (chat_id, party_id, network, type) VALUES (?, ?, ?, ?)`).run(
     chat_id,
