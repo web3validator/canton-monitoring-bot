@@ -84,13 +84,52 @@ function loadCallback(key: string): string | undefined {
 async function fetchUptime(party_id: string, network: Network): Promise<string> {
   const cfg = NETWORK_CONFIG[network];
   try {
+    const lhRes = await fetch(
+      `${cfg.lighthouseUrl}/api/validators/${encodeURIComponent(party_id)}`,
+      { signal: AbortSignal.timeout(8000) },
+    );
+    if (lhRes.ok) {
+      const lhData = (await lhRes.json()) as {
+        validator?: { first_round?: number; last_round?: number; miss_round?: number };
+      };
+      const v = lhData.validator;
+      if (v && v.first_round != null && v.last_round != null && v.miss_round != null) {
+        const total = v.last_round - v.first_round;
+        if (total > 0) {
+          const pct = (((total - v.miss_round) / total) * 100).toFixed(1);
+          const missed = v.miss_round;
+          return `\n*Uptime (all-time):* ${pct}% _(${missed} rounds missed)_`;
+        }
+      }
+    }
+  } catch {}
+
+  try {
     const res = await fetch(
-      `${cfg.indexerUrl}/api/validators/${encodeURIComponent(party_id)}/uptime?limit=168`,
+      `${cfg.indexerUrl}/api/validators/${encodeURIComponent(party_id)}/uptime?limit=500`,
+      { signal: AbortSignal.timeout(8000) },
     );
     if (!res.ok) return "";
-    const data = (await res.json()) as { uptime_pct?: number | string };
+    const data = (await res.json()) as {
+      uptime_pct?: number | string;
+      data?: { is_active: boolean; captured_at: string }[];
+    };
     if (data.uptime_pct == null) return "";
-    return `\n*Uptime 7d:* ${Number(data.uptime_pct).toFixed(1)}%`;
+
+    const uptime7d = Number(data.uptime_pct).toFixed(1);
+
+    let uptime24h = "";
+    if (data.data && data.data.length > 0) {
+      const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+      const recent = data.data.filter((s) => new Date(s.captured_at).getTime() >= cutoff);
+      if (recent.length > 0) {
+        const activeCnt = recent.filter((s) => s.is_active).length;
+        const pct = ((activeCnt / recent.length) * 100).toFixed(1);
+        uptime24h = `\n*Uptime 24h:* ${pct}%`;
+      }
+    }
+
+    return `${uptime24h}\n*Uptime 7d:* ${uptime7d}%`;
   } catch {
     return "";
   }
