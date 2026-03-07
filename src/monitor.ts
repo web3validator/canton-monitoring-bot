@@ -1,7 +1,6 @@
 import type { Bot } from "grammy";
 import {
   fetchWithFallback,
-  parseNetwork,
   NETWORKS,
   type Network,
   type Validator,
@@ -27,7 +26,9 @@ async function notifyAdmin(bot: Bot, msg: string): Promise<void> {
 
 const POLL_INTERVAL_MS = 5 * 60_000;
 const OFFLINE_THRESHOLD_MS = 25 * 60 * 1000;
-const POLL_NETWORK_TIMEOUT_MS = 30_000;
+const POLL_NETWORK_TIMEOUT_MS = 60_000;
+
+const pendingOffline = new Map<string, number>();
 
 const dominantVersionCache: Partial<Record<Network, string>> = {};
 
@@ -71,44 +72,42 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
   });
 }
 
+async function fetchValidatorById(id: string, network: Network): Promise<Validator | null> {
+  const result = await fetchWithFallback<Validator>(
+    `/api/validators/${encodeURIComponent(id)}`,
+    network,
+  );
+  return result?.data ?? null;
+}
+
+async function fetchNetworkVersion(network: Network): Promise<string | null> {
+  const result = await fetchWithFallback<{ version?: string }>("/api/stats", network);
+  return result?.data.version ?? null;
+}
+
 async function pollNetwork(bot: Bot, network: Network): Promise<void> {
   const cfg = NETWORK_CONFIG[network];
   console.log(`[monitor] polling ${network}...`);
 
-  const result = await fetchWithFallback<ValidatorsResponse>(
-    "/api/validators?page_size=5000",
-    network,
-  );
-  if (!result) {
-    console.warn(`[monitor] ${network}: no data from indexer/lighthouse`);
-    return;
-  }
-
-  const validators = result.data.data ?? result.data.validators ?? [];
-  if (validators.length === 0) {
-    console.warn(`[monitor] ${network}: empty validators list`);
-    return;
-  }
-
-  const dominant = getDominantVersion(validators);
-  if (dominant) dominantVersionCache[network] = dominant;
-
-  // Build lookup map by both party_id and id
-  const validatorMap = new Map<string, Validator>();
-  for (const v of validators) {
-    validatorMap.set(v.id, v);
-    if (v.party_id) validatorMap.set(v.party_id, v);
-  }
-
   const tracked = getTrackedValidators().filter((t) => t.network === network);
+  if (tracked.length === 0) {
+    console.log(`[monitor] ${network}: no tracked validators`);
+    return;
+  }
+
+  const networkVersion = await fetchNetworkVersion(network);
+  if (networkVersion) {
+    dominantVersionCache[network] = networkVersion;
+    console.log(`[monitor] ${network}: network version = ${networkVersion}`);
+  }
+
   let alertsSent = 0;
 
   for (const { party_id } of tracked) {
-    const v = validatorMap.get(party_id);
+    const v = await fetchValidatorById(party_id, network);
+
     if (!v) {
-      console.log(
-        `[monitor] ${network}: tracked validator not found in API: ${party_id.slice(0, 40)}...`,
-      );
+      console.log(`[monitor] ${network}: validator not found: ${party_id.slice(0, 40)}...`);
       continue;
     }
 
@@ -127,32 +126,40 @@ async function pollNetwork(bot: Bot, network: Network): Promise<void> {
 
     const label = cfg.label;
     const name = v.name ?? v.id.split("::")[0] ?? party_id.slice(0, 20) + "…";
+    const pendingKey = `${network}:${party_id}`;
 
-    // ── Offline alert: transition 1→0 OR first seen as offline ──
+    // ── Offline alert with 2-poll cooldown ──
     const wentOffline = prevState && prevState.is_active === 1 && !effectivelyActive;
     const firstSeenOffline = !prevState && !effectivelyActive;
 
     if (wentOffline || firstSeenOffline) {
-      const reason = !isActive
-        ? "is_active = false"
-        : stale
-          ? `not seen for ${formatLastSeen(lastSeenAt)}`
-          : "offline";
-      const msg =
-        `🔴 *[${label}] Validator offline*\n` +
-        `*${name}*\n` +
-        `Reason: ${reason}\n` +
-        `Party: \`${party_id}\``;
-      console.log(
-        `[monitor] ALERT offline: ${name} on ${network} (${firstSeenOffline ? "first-seen" : "transition"})`,
-      );
-      for (const chat_id of subscribers) {
-        await bot.api.sendMessage(chat_id, msg, { parse_mode: "Markdown" }).catch((err) => {
-          console.error(`[monitor] failed to send offline alert to ${chat_id}:`, err);
-        });
-        logAlert(chat_id, party_id, network, "offline");
-        alertsSent++;
+      const count = (pendingOffline.get(pendingKey) ?? 0) + 1;
+      pendingOffline.set(pendingKey, count);
+      console.log(`[monitor] ${name} offline on ${network}, pending count: ${count}`);
+
+      if (count >= 2) {
+        pendingOffline.delete(pendingKey);
+        const reason = !isActive
+          ? "is_active = false"
+          : stale
+            ? `not seen for ${formatLastSeen(lastSeenAt)}`
+            : "offline";
+        const msg =
+          `🔴 *[${label}] Validator offline*\n` +
+          `*${name}*\n` +
+          `Reason: ${reason}\n` +
+          `Party: \`${party_id}\``;
+        console.log(`[monitor] ALERT offline: ${name} on ${network}`);
+        for (const chat_id of subscribers) {
+          await bot.api.sendMessage(chat_id, msg, { parse_mode: "Markdown" }).catch((err) => {
+            console.error(`[monitor] failed to send offline alert to ${chat_id}:`, err);
+          });
+          logAlert(chat_id, party_id, network, "offline");
+          alertsSent++;
+        }
       }
+    } else {
+      pendingOffline.delete(pendingKey);
     }
 
     // ── Back online alert: transition 0→1 ──
@@ -195,9 +202,7 @@ async function pollNetwork(bot: Bot, network: Network): Promise<void> {
     }
   }
 
-  console.log(
-    `[monitor] ${network} done: ${validators.length} validators, ${tracked.length} tracked, ${alertsSent} alerts sent`,
-  );
+  console.log(`[monitor] ${network} done: ${tracked.length} tracked, ${alertsSent} alerts sent`);
 }
 
 export async function getValidatorInfo(query: string, network: Network): Promise<Validator | null> {
