@@ -15,6 +15,7 @@ import {
   upsertValidatorState,
   logAlert,
   getLastAlertType,
+  getAllOfflineValidatorStates,
 } from "./db.js";
 
 const ADMIN_CHAT_ID = process.env["ADMIN_CHAT_ID"] ? Number(process.env["ADMIN_CHAT_ID"]) : null;
@@ -24,11 +25,22 @@ async function notifyAdmin(bot: Bot, msg: string): Promise<void> {
   await bot.api.sendMessage(ADMIN_CHAT_ID, msg, { parse_mode: "Markdown" }).catch(() => {});
 }
 
-const POLL_INTERVAL_MS = 5 * 60_000;
-const OFFLINE_THRESHOLD_MS = 25 * 60 * 1000;
-const POLL_NETWORK_TIMEOUT_MS = 60_000;
+const POLL_INTERVAL_MS = 5 * 60 * 1000;
+const POLL_NETWORK_TIMEOUT_MS = 60 * 1000;
+const OFFLINE_THRESHOLD_MS = 30 * 60 * 1000;
 
 const pendingOffline = new Map<string, number>();
+
+function restorePendingOffline(): void {
+  const offlineStates = getAllOfflineValidatorStates();
+  for (const { party_id, network } of offlineStates) {
+    const key = `${network}:${party_id}`;
+    pendingOffline.set(key, 1);
+  }
+  if (offlineStates.length > 0) {
+    console.log(`[monitor] restored ${offlineStates.length} pending offline from state`);
+  }
+}
 
 const dominantVersionCache: Partial<Record<Network, string>> = {};
 
@@ -125,14 +137,20 @@ async function pollNetwork(bot: Bot, network: Network): Promise<void> {
     if (subscribers.length === 0) continue;
 
     const label = cfg.label;
-    const name = v.name ?? v.id.split("::")[0] ?? party_id.slice(0, 20) + "…";
+    const name =
+      v.name ?? v.id?.split("::")[0] ?? party_id.split("::")[0] ?? party_id.slice(0, 20) + "…";
     const pendingKey = `${network}:${party_id}`;
 
     // ── Offline alert with 2-poll cooldown ──
     const wentOffline = prevState && prevState.is_active === 1 && !effectivelyActive;
     const firstSeenOffline = !prevState && !effectivelyActive;
+    const stillOffline =
+      prevState &&
+      prevState.is_active === 0 &&
+      !effectivelyActive &&
+      pendingOffline.has(pendingKey);
 
-    if (wentOffline || firstSeenOffline) {
+    if (wentOffline || firstSeenOffline || stillOffline) {
       const count = (pendingOffline.get(pendingKey) ?? 0) + 1;
       pendingOffline.set(pendingKey, count);
       console.log(`[monitor] ${name} offline on ${network}, pending count: ${count}`);
@@ -148,10 +166,10 @@ async function pollNetwork(bot: Bot, network: Network): Promise<void> {
           `🔴 *[${label}] Validator offline*\n` +
           `*${name}*\n` +
           `Reason: ${reason}\n` +
-          `Party: \`${party_id}\``;
+          `Party: ${party_id}`;
         console.log(`[monitor] ALERT offline: ${name} on ${network}`);
         for (const chat_id of subscribers) {
-          await bot.api.sendMessage(chat_id, msg, { parse_mode: "Markdown" }).catch((err) => {
+          await bot.api.sendMessage(chat_id, msg).catch((err) => {
             console.error(`[monitor] failed to send offline alert to ${chat_id}:`, err);
           });
           logAlert(chat_id, party_id, network, "offline");
@@ -162,18 +180,19 @@ async function pollNetwork(bot: Bot, network: Network): Promise<void> {
       pendingOffline.delete(pendingKey);
     }
 
-    // ── Back online alert: transition 0→1 ──
+    // ── Back online alert: transition 0→1, only if offline was actually sent ──
     if (prevState && prevState.is_active === 0 && effectivelyActive) {
-      const msg =
-        `🟢 *[${label}] Validator back online*\n` + `*${name}*\n` + `Party: \`${party_id}\``;
+      const msg = `🟢 *[${label}] Validator back online*\n` + `*${name}*\n` + `Party: ${party_id}`;
       console.log(`[monitor] ALERT online: ${name} on ${network}`);
       for (const chat_id of subscribers) {
         const lastAlert = getLastAlertType(chat_id, party_id, network);
-        if (lastAlert === "online") {
-          console.log(`[monitor] skip duplicate online alert for ${name} (${chat_id})`);
+        if (lastAlert !== "offline") {
+          console.log(
+            `[monitor] skip online alert for ${name} (${chat_id}): last alert was ${lastAlert ?? "none"}`,
+          );
           continue;
         }
-        await bot.api.sendMessage(chat_id, msg, { parse_mode: "Markdown" }).catch((err) => {
+        await bot.api.sendMessage(chat_id, msg).catch((err) => {
           console.error(`[monitor] failed to send online alert to ${chat_id}:`, err);
         });
         logAlert(chat_id, party_id, network, "online");
@@ -189,11 +208,11 @@ async function pollNetwork(bot: Bot, network: Network): Promise<void> {
       const msg =
         `⚠️ *[${label}] Outdated version*\n` +
         `*${name}*\n` +
-        `Version: \`${v.version}\` (network: \`${dom}\`)\n` +
-        `Party: \`${party_id}\``;
+        `Version: ${v.version} (network: ${dom})\n` +
+        `Party: ${party_id}`;
       console.log(`[monitor] ALERT version: ${name} on ${network}: ${v.version} vs ${dom}`);
       for (const chat_id of subscribers) {
-        await bot.api.sendMessage(chat_id, msg, { parse_mode: "Markdown" }).catch((err) => {
+        await bot.api.sendMessage(chat_id, msg).catch((err) => {
           console.error(`[monitor] failed to send version alert to ${chat_id}:`, err);
         });
         logAlert(chat_id, party_id, network, "version");
@@ -245,6 +264,7 @@ export const lastPollOk: Partial<Record<Network, Date>> = {};
 
 export function startMonitor(bot: Bot): void {
   console.log("[monitor] starting polling for networks:", NETWORKS.join(", "));
+  restorePendingOffline();
   console.log(
     `[monitor] poll interval: ${POLL_INTERVAL_MS / 1000}s, offline threshold: ${OFFLINE_THRESHOLD_MS / 1000}s, poll timeout: ${POLL_NETWORK_TIMEOUT_MS / 1000}s`,
   );

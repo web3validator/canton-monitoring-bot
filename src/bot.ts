@@ -12,7 +12,12 @@ import {
   extractRoundNumber,
   type Network,
 } from "./networks.js";
-import { addSubscription, removeSubscription, getSubscriptions } from "./db.js";
+import {
+  addSubscription,
+  removeSubscription,
+  removeAllSubscriptions,
+  getSubscriptions,
+} from "./db.js";
 import {
   getValidatorInfo,
   findAllValidators,
@@ -338,7 +343,7 @@ async function subscribeConversation(conversation: MyConversation, ctx: MyContex
     await ctx.reply(
       `✅ *Subscribed* to validator on ${label}\n\n` +
         `*Name:* ${name}\n*Status:* ${status}\n*Version:* \`${v.version ?? "unknown"}\`\n` +
-        `*ID:* \`${canonical_id}\`\n\nYou'll get alerts when status changes.\n_Note: detection delay is ~25 min (1 Canton round = 10 min)._`,
+        `*ID:* \`${canonical_id}\`\n\nYou'll get alerts when status changes.\n_Note: detection delay is ~50 min (4 Canton rounds × 10 min + 2 poll cycles)._`,
       { parse_mode: "Markdown", reply_markup: mainKeyboard() },
     );
   } else {
@@ -366,6 +371,7 @@ async function unsubscribeConversation(
   }
 
   const kb = new InlineKeyboard();
+  kb.text(`🗑 Unsubscribe All on ${label} (${subs.length})`, "unsub:all").row();
   for (const s of subs) {
     const short = s.party_id.split("::")[0];
     const key = storeCallback(s.party_id);
@@ -388,6 +394,21 @@ async function unsubscribeConversation(
       )
       .catch(() => {});
     await ctx.reply("❌ Cancelled.", { reply_markup: mainKeyboard() });
+    return;
+  }
+
+  if (cb.callbackQuery.data === "unsub:all") {
+    const count = removeAllSubscriptions(ctx.chat!.id, network);
+    await ctx.api
+      .editMessageText(
+        sentUnsub.chat.id,
+        sentUnsub.message_id,
+        `Select subscription to remove on ${label}: 🗑 All removed.`,
+      )
+      .catch(() => {});
+    await ctx.reply(`✅ Unsubscribed from all ${count} validators on ${label}.`, {
+      reply_markup: mainKeyboard(),
+    });
     return;
   }
 
@@ -479,14 +500,30 @@ bot.hears("📋 My List", async (ctx) => {
     list.push(s);
     byNetwork.set(s.network, list);
   }
-  let msg = `📋 *Your subscriptions (${subs.length}):*\n`;
+
+  const lines: string[] = [`📋 *Your subscriptions (${subs.length}):*`];
   for (const net of NETWORKS) {
     const list = byNetwork.get(net);
     if (!list?.length) continue;
-    msg += `\n*${NETWORK_CONFIG[net].label}:*\n`;
-    for (const s of list) msg += `  • \`${s.party_id}\`\n`;
+    lines.push(`\n*${NETWORK_CONFIG[net].label}:*`);
+    for (const s of list) lines.push(`  • \`${s.party_id.split("::")[0]}\``);
   }
-  await ctx.reply(msg, { parse_mode: "Markdown" });
+
+  const chunks: string[] = [];
+  let current = "";
+  for (const line of lines) {
+    if ((current + "\n" + line).length > 3800) {
+      chunks.push(current);
+      current = line;
+    } else {
+      current = current ? current + "\n" + line : line;
+    }
+  }
+  if (current) chunks.push(current);
+
+  for (const chunk of chunks) {
+    await ctx.reply(chunk, { parse_mode: "Markdown" });
+  }
 });
 
 bot.hears("📊 Network Stats", async (ctx) => {
@@ -572,7 +609,7 @@ bot.command("track", async (ctx) => {
   const status = v.is_active ? "🟢 online" : "🔴 offline";
   if (added) {
     await ctx.reply(
-      `✅ *Subscribed* to validator on ${label}\n\n*Name:* ${name}\n*Status:* ${status}\n*ID:* \`${canonical_id}\`\n\nYou'll get alerts when status changes.\n_Note: detection delay is ~25 min (1 Canton round = 10 min)._`,
+      `✅ *Subscribed* to validator on ${label}\n\n*Name:* ${name}\n*Status:* ${status}\n*ID:* \`${canonical_id}\`\n\nYou'll get alerts when status changes.\n_Note: detection delay is ~50 min (4 Canton rounds × 10 min + 2 poll cycles)._`,
       { parse_mode: "Markdown" },
     );
   } else {

@@ -36,6 +36,14 @@ db.exec(`
     type        TEXT    NOT NULL,
     sent_at     TEXT    NOT NULL DEFAULT (datetime('now'))
   );
+
+  CREATE TABLE IF NOT EXISTS pending_offline (
+    party_id    TEXT    NOT NULL,
+    network     TEXT    NOT NULL,
+    count       INTEGER NOT NULL DEFAULT 1,
+    updated_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (party_id, network)
+  );
 `);
 
 export interface Subscription {
@@ -75,6 +83,15 @@ export function removeSubscription(chat_id: number, party_id: string, network: N
   return result.changes > 0;
 }
 
+export function removeAllSubscriptions(chat_id: number, network?: Network): number {
+  const result = network
+    ? db
+        .prepare(`DELETE FROM subscriptions WHERE chat_id = ? AND network = ?`)
+        .run(chat_id, network)
+    : db.prepare(`DELETE FROM subscriptions WHERE chat_id = ?`).run(chat_id);
+  return result.changes;
+}
+
 export function getSubscriptions(chat_id: number): Subscription[] {
   return db
     .prepare(`SELECT * FROM subscriptions WHERE chat_id = ? ORDER BY network, party_id`)
@@ -90,6 +107,13 @@ export function getSubscribersForValidator(party_id: string, network: Network): 
     .prepare(`SELECT chat_id FROM subscriptions WHERE party_id = ? AND network = ?`)
     .all(party_id, network) as { chat_id: number }[];
   return rows.map((r) => r.chat_id);
+}
+
+export function getAllOfflineValidatorStates(): { party_id: string; network: Network }[] {
+  return db.prepare(`SELECT party_id, network FROM validator_state WHERE is_active = 0`).all() as {
+    party_id: string;
+    network: Network;
+  }[];
 }
 
 export function getTrackedValidators(): { party_id: string; network: Network }[] {
