@@ -116,6 +116,15 @@ export function getAllOfflineValidatorStates(): { party_id: string; network: Net
   }[];
 }
 
+export function wasOfflineAlertSent(party_id: string, network: Network): boolean {
+  const row = db
+    .prepare(
+      `SELECT type FROM alert_log WHERE party_id = ? AND network = ? ORDER BY sent_at DESC LIMIT 1`,
+    )
+    .get(party_id, network) as { type: string } | undefined;
+  return row?.type === "offline";
+}
+
 export function getTrackedValidators(): { party_id: string; network: Network }[] {
   return db.prepare(`SELECT DISTINCT party_id, network FROM subscriptions`).all() as {
     party_id: string;

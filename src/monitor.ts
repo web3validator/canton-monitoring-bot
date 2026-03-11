@@ -8,6 +8,15 @@ import {
   type NetworkStats,
   NETWORK_CONFIG,
 } from "./networks.js";
+
+interface NodeStatus {
+  enabled: boolean;
+  lag_seconds: number | null;
+  last_ingested_at: string | null;
+  is_healthy: boolean | null;
+  validator_name: string | null;
+  validator_party: string | null;
+}
 import {
   getTrackedValidators,
   getSubscribersForValidator,
@@ -16,9 +25,16 @@ import {
   logAlert,
   getLastAlertType,
   getAllOfflineValidatorStates,
+  wasOfflineAlertSent,
 } from "./db.js";
 
 const ADMIN_CHAT_ID = process.env["ADMIN_CHAT_ID"] ? Number(process.env["ADMIN_CHAT_ID"]) : null;
+
+const NODE_POLL_INTERVAL_MS = 60 * 1000;
+const NODE_LAG_WARN_SEC = 600;
+const NODE_LAG_OFFLINE_SEC = 1200;
+
+const nodeAlertState: Partial<Record<Network, "warn" | "offline" | "ok">> = {};
 
 async function notifyAdmin(bot: Bot, msg: string): Promise<void> {
   if (!ADMIN_CHAT_ID) return;
@@ -26,6 +42,71 @@ async function notifyAdmin(bot: Bot, msg: string): Promise<void> {
 }
 
 const POLL_INTERVAL_MS = 5 * 60 * 1000;
+
+async function fetchNodeStatus(network: Network): Promise<NodeStatus | null> {
+  const url = NETWORK_CONFIG[network].nodeStatusUrl;
+  if (!url) return null;
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    if (!res.ok) return null;
+    return (await res.json()) as NodeStatus;
+  } catch {
+    return null;
+  }
+}
+
+async function pollNodeStatus(bot: Bot, network: Network): Promise<void> {
+  const cfg = NETWORK_CONFIG[network];
+  const status = await fetchNodeStatus(network);
+  if (!status || !status.enabled || status.lag_seconds === null) {
+    console.log(`[node-monitor] ${network}: no data (enabled=${status?.enabled ?? false})`);
+    return;
+  }
+
+  const lag = status.lag_seconds;
+  console.log(`[node-monitor] ${network}: lag=${lag}s, node=${status.validator_name ?? "unknown"}`);
+  const prev = nodeAlertState[network] ?? "ok";
+  const subscribers = getTrackedValidators()
+    .filter((t) => t.network === network)
+    .flatMap((t) => getSubscribersForValidator(t.party_id, network));
+  const uniqueSubs = [...new Set(subscribers)];
+  if (uniqueSubs.length === 0) return;
+
+  const nodeName = status.validator_name ?? status.validator_party?.split("::")[0] ?? cfg.label;
+
+  if (lag >= NODE_LAG_OFFLINE_SEC && prev !== "offline") {
+    nodeAlertState[network] = "offline";
+    const mins = Math.floor(lag / 60);
+    const msg =
+      `🔴 *[${cfg.label}] Validator node offline*\n` +
+      `*${nodeName}*\n` +
+      `Node not processing ledger for *${mins} min*\n` +
+      `Last activity: ${status.last_ingested_at ?? "unknown"}`;
+    for (const chat_id of uniqueSubs) {
+      await bot.api.sendMessage(chat_id, msg, { parse_mode: "Markdown" }).catch(() => {});
+    }
+    console.log(`[node-monitor] ${network}: OFFLINE alert sent (lag=${lag}s)`);
+  } else if (lag >= NODE_LAG_WARN_SEC && lag < NODE_LAG_OFFLINE_SEC && prev === "ok") {
+    nodeAlertState[network] = "warn";
+    const mins = Math.floor(lag / 60);
+    const msg =
+      `⚠️ *[${cfg.label}] Validator node slow*\n` +
+      `*${nodeName}*\n` +
+      `Node not processing ledger for *${mins} min*`;
+    for (const chat_id of uniqueSubs) {
+      await bot.api.sendMessage(chat_id, msg, { parse_mode: "Markdown" }).catch(() => {});
+    }
+    console.log(`[node-monitor] ${network}: WARN alert sent (lag=${lag}s)`);
+  } else if (lag < NODE_LAG_WARN_SEC && (prev === "offline" || prev === "warn")) {
+    nodeAlertState[network] = "ok";
+    const msg =
+      `🟢 *[${cfg.label}] Validator node recovered*\n` + `*${nodeName}*\n` + `Lag: *${lag}s*`;
+    for (const chat_id of uniqueSubs) {
+      await bot.api.sendMessage(chat_id, msg, { parse_mode: "Markdown" }).catch(() => {});
+    }
+    console.log(`[node-monitor] ${network}: RECOVERED (lag=${lag}s)`);
+  }
+}
 const POLL_NETWORK_TIMEOUT_MS = 60 * 1000;
 const OFFLINE_THRESHOLD_MS = 30 * 60 * 1000;
 
@@ -33,12 +114,17 @@ const pendingOffline = new Map<string, number>();
 
 function restorePendingOffline(): void {
   const offlineStates = getAllOfflineValidatorStates();
+  let restored = 0;
   for (const { party_id, network } of offlineStates) {
+    if (wasOfflineAlertSent(party_id, network)) continue;
     const key = `${network}:${party_id}`;
     pendingOffline.set(key, 1);
+    restored++;
   }
   if (offlineStates.length > 0) {
-    console.log(`[monitor] restored ${offlineStates.length} pending offline from state`);
+    console.log(
+      `[monitor] restored ${restored}/${offlineStates.length} pending offline from state (skipped already alerted)`,
+    );
   }
 }
 
@@ -294,4 +380,20 @@ export function startMonitor(bot: Bot): void {
     void poll();
     setInterval(() => void poll(), POLL_INTERVAL_MS);
   }, 10_000);
+
+  const pollNodes = async () => {
+    for (const network of NETWORKS) {
+      if (!NETWORK_CONFIG[network].nodeStatusUrl) continue;
+      try {
+        await pollNodeStatus(bot, network);
+      } catch (err) {
+        console.error(`[node-monitor] error polling ${network}:`, err);
+      }
+    }
+  };
+
+  setTimeout(() => {
+    void pollNodes();
+    setInterval(() => void pollNodes(), NODE_POLL_INTERVAL_MS);
+  }, 15_000);
 }

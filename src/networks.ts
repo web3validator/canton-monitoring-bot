@@ -5,9 +5,10 @@ export const NETWORKS: Network[] = ["mainnet", "testnet", "devnet"];
 export interface NetworkConfig {
   name: Network;
   label: string;
-  endpoints: string[]; // primary first, then fallbacks
-  lighthouseUrl: string; // direct lighthouse (always public)
+  endpoints: string[];
+  lighthouseUrl: string;
   indexerUrl: string;
+  nodeStatusUrl: string | null;
 }
 
 export const NETWORK_CONFIG: Record<Network, NetworkConfig> = {
@@ -20,6 +21,7 @@ export const NETWORK_CONFIG: Record<Network, NetworkConfig> = {
     ],
     lighthouseUrl: "https://lighthouse.cantonloop.com",
     indexerUrl: "https://mainnet-canton-indexer.web34ever.com",
+    nodeStatusUrl: "https://mainnet-canton-indexer.web34ever.com/api/validator/node-status",
   },
   testnet: {
     name: "testnet",
@@ -30,6 +32,7 @@ export const NETWORK_CONFIG: Record<Network, NetworkConfig> = {
     ],
     lighthouseUrl: "https://lighthouse.testnet.cantonloop.com",
     indexerUrl: "https://testnet-canton-indexer.web34ever.com",
+    nodeStatusUrl: "https://testnet-canton-indexer.web34ever.com/api/validator/node-status",
   },
   devnet: {
     name: "devnet",
@@ -40,6 +43,7 @@ export const NETWORK_CONFIG: Record<Network, NetworkConfig> = {
     ],
     lighthouseUrl: "https://lighthouse.devnet.cantonloop.com",
     indexerUrl: "https://devnet-canton-indexer.web34ever.com",
+    nodeStatusUrl: "https://devnet-canton-indexer.web34ever.com/api/validator/node-status",
   },
 };
 
@@ -67,9 +71,9 @@ export interface ValidatorsResponse {
 export interface NetworkStats {
   version?: string;
   total_validator?: number;
-  total_validators?: number; // fallback
+  total_validators?: number;
   rounds?: Array<{ round: number }> | number;
-  total_rounds?: number; // fallback
+  total_rounds?: number;
   cc_price?: string | number;
   total_cc?: string | number;
   total_parties?: number;
@@ -84,7 +88,6 @@ export function extractRoundNumber(stats: NetworkStats): string {
   return r !== undefined ? String(r) : "unknown";
 }
 
-// Fetch with fallback — tries each endpoint in order
 export async function fetchWithFallback<T>(
   path: string,
   network: Network,
